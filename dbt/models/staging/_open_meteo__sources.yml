@@ -1,0 +1,9 @@
+version: 2
+
+sources:
+  - name: open_meteo
+    database: AI_DWH
+    schema: WEATHER_RAW
+    tables:
+      - name: responses
+        identifier: OPEN_METEO_RESPONSES

@@ -1,0 +1,12 @@
+version: 2
+
+models:
+  - name: stg_open_meteo__hourly
+    description: One row per raw Open-Meteo response and UTC weather hour.
+    columns:
+      - name: weather_hour_utc
+        data_tests: [not_null]
+      - name: source_content_hash
+        data_tests: [not_null]
+      - name: relative_humidity_pct
+      - name: precipitation_mm
