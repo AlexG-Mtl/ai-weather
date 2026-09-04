@@ -1,0 +1,153 @@
+name: CD
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-weather-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy production
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    env:
+      SNOWFLAKE_CONNECTION_NAME: ai_dwh_svc
+      SNOWFLAKE_CLI_VERSION: 3.24.1
+    steps:
+      - name: Check out pushed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Install pinned Snowflake CLI
+        run: uv tool install "snowflake-cli==${SNOWFLAKE_CLI_VERSION}"
+
+      - name: Create production Snowflake connection
+        shell: bash
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          for sensitive_value in \
+            "${SNOWFLAKE_ACCOUNT}" \
+            "${SNOWFLAKE_USER}" \
+            "${SNOWFLAKE_WAREHOUSE}" \
+            "${SNOWFLAKE_ROLE}"; do
+            echo "::add-mask::${sensitive_value}"
+          done
+          credential_home="${RUNNER_TEMP}/ai-weather-cd-home"
+          config_dir="${credential_home}/.snowflake"
+          key_file="${credential_home}/service-key.p8"
+          mkdir -p "${config_dir}"
+          chmod 700 "${credential_home}" "${config_dir}"
+          printf '%s' "${SNOWFLAKE_PRIVATE_KEY}" > "${key_file}"
+          chmod 600 "${key_file}"
+          export HOME="${credential_home}"
+          snow connection add \
+            --connection-name ai_dwh_svc \
+            --account "${SNOWFLAKE_ACCOUNT}" \
+            --user "${SNOWFLAKE_USER}" \
+            --warehouse "${SNOWFLAKE_WAREHOUSE}" \
+            --role "${SNOWFLAKE_ROLE}" \
+            --authenticator SNOWFLAKE_JWT \
+            --private-key-file "${key_file}" \
+            --no-interactive
+          chmod 600 "${config_dir}/config.toml"
+          printf 'HOME=%s\n' "${credential_home}" >> "${GITHUB_ENV}"
+
+      - name: Verify Snowflake authentication
+        run: |
+          set -euo pipefail
+          snow sql -c ai_dwh_svc \
+            -q 'select current_account(), current_user(), current_role(), current_warehouse()'
+
+      - name: Provision raw objects
+        run: |
+          set -euo pipefail
+          snow sql -c ai_dwh_svc -f sql/create_raw_objects.sql
+
+      - name: Ingest fixed-date weather
+        shell: bash
+        run: |
+          set -euo pipefail
+          content_hash="$(uv run ai-weather 2024-01-01 2024-01-01)"
+          if [[ ! "${content_hash}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo 'Ingestion did not emit a valid SHA-256 content hash.' >&2
+            exit 1
+          fi
+          echo "::add-mask::${content_hash}"
+          printf 'CONTENT_HASH=%s\n' "${content_hash}" >> "${GITHUB_ENV}"
+
+      - name: Validate raw weather data
+        shell: bash
+        run: |
+          set -euo pipefail
+          snow sql -c ai_dwh_svc --format json -q "
+            select count_if(
+              start_date = '2024-01-01'::date
+              and end_date = '2024-01-01'::date
+              and is_array(payload:hourly:time)
+              and array_size(payload:hourly:time) > 0
+            ) > 0 as validation_passed
+            from AI_DWH.WEATHER_RAW.OPEN_METEO_RESPONSES
+            where content_hash = '${CONTENT_HASH}'
+          " | jq -e '.[0].VALIDATION_PASSED == true'
+
+      - name: Build staging model
+        run: |
+          set -euo pipefail
+          uv run ai-weather-dbt run --project-dir dbt --profiles-dir dbt \
+            --select stg_open_meteo__hourly
+
+      - name: Test staging model
+        run: |
+          set -euo pipefail
+          uv run ai-weather-dbt test --project-dir dbt --profiles-dir dbt \
+            --select stg_open_meteo__hourly
+
+      - name: Validate staging weather data
+        shell: bash
+        run: |
+          set -euo pipefail
+          snow sql -c ai_dwh_svc --format json -q "
+            select count(*) > 0
+              and count_if(weather_hour_utc is null) = 0
+              and count_if(to_date(weather_hour_utc) != '2024-01-01'::date) = 0
+              as validation_passed
+            from AI_DWH.WEATHER_STAGING.STG_OPEN_METEO__HOURLY
+            where source_content_hash = '${CONTENT_HASH}'
+          " | jq -e '.[0].VALIDATION_PASSED == true'
+
+      - name: Remove production credentials
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          credential_home="${RUNNER_TEMP}/ai-weather-cd-home"
+          if [[ -d "${credential_home}" ]]; then
+            find "${credential_home}" -type f -exec shred -u {} +
+            find "${credential_home}" -depth -type d -empty -delete
+          fi
