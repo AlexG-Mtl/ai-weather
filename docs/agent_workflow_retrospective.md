@@ -16,6 +16,8 @@ Final validation:
 - dbt model: 1 passed
 - dbt tests: 5 passed
 - Final Reviewer verdict: APPROVE
+- PR CI passed in GitHub
+- Post-merge CD passed on `main`
 
 ## What worked
 
@@ -57,6 +59,17 @@ It found a real defect that the Builder's own tests had missed:
 
 After remediation, the Reviewer independently returned APPROVE.
 
+### CI/CD phase
+
+Planner → Builder → independent Reviewer worked well for the CI/CD change.
+The approved specification gave the Builder an exact executable validation
+sequence, so a short prompt referencing it was more effective than duplicating
+the requirements.
+
+PR CI passed successfully in GitHub. After merge to `main`, CD also completed
+successfully and validated the real Open-Meteo → Snowflake RAW → dbt staging
+pipeline.
+
 ## What did not work well
 
 ### Bootstrap/setup sequence was underspecified
@@ -90,6 +103,12 @@ but live Snowflake execution exposed authentication and provisioning problems.
 For data-engineering work, successful parsing/unit tests should not be treated
 as equivalent to end-to-end validation.
 
+The first implementation validation also failed to execute the real ingestion.
+Because dbt tests can pass against an empty source, those passing tests did not
+prove end-to-end success. The CI/CD specification corrected this by defining an
+exact executable sequence that runs ingestion and asserts that RAW and staging
+are both non-empty for the same payload.
+
 ### Human intervention was still required
 
 The human had to resolve an infrastructure permission:
@@ -109,11 +128,11 @@ putting them into Builder and Reviewer prompts.
 Every future plan should include an explicit end-to-end validation sequence:
 
 1. Provision required objects.
-2. Run ingestion.
-3. Verify raw data.
+2. Run ingestion for a known payload.
+3. Assert RAW is non-empty for that payload.
 4. Run transformations.
 5. Run tests.
-6. Verify representative output.
+6. Assert staging is non-empty for the same payload.
 
 Environment prerequisites and required privileges should also be stated
 explicitly.
