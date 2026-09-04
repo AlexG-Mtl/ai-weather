@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out pull request commit
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Run tests
+        run: uv run pytest
+
+      - name: Create non-production dbt parse credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          credential_home="${RUNNER_TEMP}/ai-weather-ci-home"
+          credential_dir="${credential_home}/.snowflake"
+          key_file="${credential_home}/placeholder-key.p8"
+          config_file="${credential_dir}/config.toml"
+          mkdir -p "${credential_dir}"
+          chmod 700 "${credential_home}" "${credential_dir}"
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+            -out "${key_file}" 2>/dev/null
+          chmod 600 "${key_file}"
+          printf '%s\n' \
+            '[connections.ai_dwh_svc]' \
+            'account = "non-production-placeholder"' \
+            'user = "non-production-placeholder"' \
+            'warehouse = "non-production-placeholder"' \
+            'role = "non-production-placeholder"' \
+            "private_key_file = \"${key_file}\"" \
+            > "${config_file}"
+          chmod 600 "${config_file}"
+          printf 'HOME=%s\n' "${credential_home}" >> "${GITHUB_ENV}"
+
+      - name: Parse dbt project
+        run: uv run ai-weather-dbt parse --project-dir dbt --profiles-dir dbt
+
+      - name: Remove non-production credentials
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          credential_home="${RUNNER_TEMP}/ai-weather-ci-home"
+          if [[ -d "${credential_home}" ]]; then
+            find "${credential_home}" -type f -exec shred -u {} +
+            find "${credential_home}" -depth -type d -empty -delete
+          fi
